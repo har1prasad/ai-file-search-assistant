@@ -1,0 +1,83 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Compiled extensions
+*.so
+*.pyd
+*.dll
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE settings
+.vscode/
+.idea/
+*.iml
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Python testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.spec
+
+# Generated application data
+data/
+
+# Model and cache directories
+models/
+.cache/
+.huggingface/
+sentence_transformers/
+
+# Local working directories
+cache/
+temp/
+output/
+
+# Sample and test files
+Sample_files/
+sample_files/
+test_files/
+demo_files/
+
+# Archives
+*.zip
+*.tar.gz
+*.tar
+*.gz
