@@ -3,24 +3,28 @@ extractor.py — Text extraction module for AI File Search Assistant (V2).
 
 V2 changes over V1:
     - Class-based architecture: BaseExtractor + per-type extractor classes
+    - OCR support for images via RapidOCR (graceful fallback if not installed)
+    - Scanned PDF detection: pages with little/no extractable text are OCR'd
     - PowerPoint support (.pptx via python-pptx)
     - Excel support (.xlsx via openpyxl)
     - Clean HTML extraction via BeautifulSoup (strips scripts, styles)
     - File metadata extraction (name, path, size, dates)
     - Text chunking with configurable size and overlap
 
-Image/OCR support is intentionally NOT included in this version.
+Image captioning is intentionally NOT included — OCR only (reads text in
+images/scanned pages, does not describe image content).
 
 Supported file types:
     Plain text  : .txt
     Markup      : .md .json .xml
     HTML        : .html .htm          (cleaned via BeautifulSoup)
-    PDF         : .pdf
+    PDF         : .pdf                (text + OCR fallback for scanned pages)
     Word        : .docx
     PowerPoint  : .pptx
     Excel       : .xlsx
     Spreadsheet : .csv
     Code        : .py .js .ts .java .c .cpp .h .hpp .cs .go .rs .php .rb .swift .kt
+    Image       : .jpg .jpeg .png .bmp .gif .webp  (OCR via RapidOCR)
 
 Public API:
     extract_text(file_path)                         → str   (V1 backward-compatible)
@@ -29,6 +33,7 @@ Public API:
     get_supported_extensions()                      → set[str]
 
 Install optional dependencies:
+    pip install rapidocr-onnxruntime    # OCR for images and scanned PDFs
     pip install python-pptx             # PowerPoint
     pip install openpyxl                # Excel
     pip install beautifulsoup4          # Clean HTML extraction
@@ -50,6 +55,9 @@ from typing import Optional
 MAX_TEXT_LENGTH: int = 50_000
 DEFAULT_CHUNK_SIZE: int = 800
 DEFAULT_CHUNK_OVERLAP: int = 150
+
+# Pages with fewer characters than this are treated as scanned (→ OCR fallback)
+SCANNED_PAGE_THRESHOLD: int = 100
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -104,6 +112,37 @@ class BaseExtractor(ABC):
     def supported_extensions(self) -> frozenset[str]:
         """Return the lowercase file extensions this extractor handles."""
         ...
+
+
+# ── OCR utility ───────────────────────────────────────────────────────────────
+
+def _run_ocr_on_bytes(image_bytes: bytes) -> str:
+    """
+    Run RapidOCR on raw image bytes.
+
+    Returns extracted text, or an empty string when RapidOCR is not installed
+    or the image yields no recognisable text.
+    """
+    try:
+        from rapidocr_onnxruntime import RapidOCR  # noqa: PLC0415
+
+        engine = RapidOCR()
+        result, _ = engine(image_bytes)
+
+        if not result:
+            return ""
+
+        return "\n".join(line[1] for line in result if line[1])
+
+    except ImportError:
+        logger.warning(
+            "RapidOCR not installed — OCR unavailable. "
+            "Install with: pip install rapidocr-onnxruntime"
+        )
+        return ""
+    except Exception as exc:
+        logger.error("OCR failed: %s", exc)
+        return ""
 
 
 # ── Extractor implementations ─────────────────────────────────────────────────
@@ -164,7 +203,14 @@ class HTMLExtractor(BaseExtractor):
 
 
 class PDFExtractor(BaseExtractor):
-    """Extracts text from PDFs using PyMuPDF."""
+    """
+    Extracts text from PDFs using PyMuPDF.
+
+    Scanned page detection: if a page yields fewer than
+    SCANNED_PAGE_THRESHOLD characters, the page is rendered to an image
+    and OCR is run on it instead. This makes scanned PDFs searchable
+    without any manual configuration.
+    """
 
     _EXTENSIONS = frozenset({".pdf"})
 
@@ -182,12 +228,32 @@ class PDFExtractor(BaseExtractor):
                 doc.close()
                 return ""
 
-            pages = [page.get_text() for page in doc]
+            pages: list[str] = []
+            for page in doc:
+                text = page.get_text()
+                if len(text.strip()) < SCANNED_PAGE_THRESHOLD:
+                    logger.info(
+                        "Page %d of '%s' appears scanned — running OCR.",
+                        page.number + 1, path.name,
+                    )
+                    text = self._ocr_page(page)
+                pages.append(text)
+
             doc.close()
             return "\n".join(pages)
 
         except Exception as exc:
             logger.error("PDFExtractor failed for '%s': %s", path.name, exc)
+            return ""
+
+    @staticmethod
+    def _ocr_page(page) -> str:
+        """Render a fitz page to PNG bytes and pass it to the OCR utility."""
+        try:
+            pix = page.get_pixmap(dpi=150)
+            return _run_ocr_on_bytes(pix.tobytes("png"))
+        except Exception as exc:
+            logger.warning("OCR fallback failed for page %d: %s", page.number + 1, exc)
             return ""
 
 
@@ -322,6 +388,33 @@ class XLSXExtractor(BaseExtractor):
             return ""
 
 
+class ImageExtractor(BaseExtractor):
+    """
+    Extracts text from images using RapidOCR (OCR only — no captioning).
+
+    Falls back to a short metadata description if RapidOCR is not
+    installed or finds no text, so files remain indexable by name.
+    """
+
+    _EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"})
+
+    def supported_extensions(self) -> frozenset[str]:
+        return self._EXTENSIONS
+
+    def extract(self, path: Path) -> str:
+        try:
+            ocr_text = _run_ocr_on_bytes(path.read_bytes())
+        except Exception as exc:
+            logger.error("ImageExtractor failed for '%s': %s", path.name, exc)
+            ocr_text = ""
+
+        if ocr_text:
+            return ocr_text
+
+        # Fallback: metadata-only, so the file is still findable by name
+        return f"Image file named {path.name} with extension {path.suffix.lower()}"
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 def _build_registry() -> dict[str, BaseExtractor]:
@@ -335,6 +428,7 @@ def _build_registry() -> dict[str, BaseExtractor]:
         CSVExtractor(),
         PPTXExtractor(),
         XLSXExtractor(),
+        ImageExtractor(),
     ]:
         for ext in extractor.supported_extensions():
             registry[ext] = extractor
@@ -495,7 +589,7 @@ def extract_with_metadata(
 if __name__ == "__main__":
     import sys
 
-    target = sys.argv[1] if len(sys.argv) > 1 else "Sample_files/capitalism.txt"
+    target = sys.argv[1] if len(sys.argv) > 1 else "Sample_files/rrrrr.png"
     result = extract_with_metadata(target)
 
     if result:

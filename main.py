@@ -8,7 +8,7 @@ Run from the project root:
 import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
-from app.ui.main_window_safe import MainWindow
+from app.ui.main_window import MainWindow
 
 
 

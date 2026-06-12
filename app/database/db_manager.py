@@ -176,6 +176,17 @@ class DatabaseManager:
 
     # Read operations
 
+    def get_all_paths(self) -> set[str]:
+        """Return all indexed file paths."""
+        try:
+            with self.connect() as conn:
+                rows = conn.execute("SELECT path FROM files").fetchall()
+                return {row["path"] for row in rows}
+        except sqlite3.Error as exc:
+            logger.error("get_all_paths failed: %s", exc)
+            return set()
+
+
     def get_file_by_id(self, file_id: int) -> dict | None:
         """Retrieve a file record by its primary key.
 
@@ -195,16 +206,7 @@ class DatabaseManager:
             logger.error("get_file_by_id failed for id=%s: %s", file_id, exc)
             return None
         
-    def get_all_paths(self) -> set[str]:
-        """Return all indexed file paths."""
-        try:
-            with self.connect() as conn:
-                rows = conn.execute("SELECT path FROM files").fetchall()
-                return {row["path"] for row in rows}
-        except sqlite3.Error as exc:
-            logger.error("get_all_paths failed: %s", exc)
-            return set()
-
+    
     def get_file_by_path(self, path: str) -> dict | None:
         """Retrieve a file record by its unique path.
 
