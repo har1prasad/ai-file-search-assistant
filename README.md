@@ -13,7 +13,7 @@ An end-to-end, local semantic document search and conversational assistant works
 ## 📸 Application Preview
 
 <p align="center">
-  <img src="app/Readme_img/Working_code.png" alt="No File Selected State" width="400"/>
+  <img src="app/Readme_img/Working_code.png" alt="No File Selected State"/>
 </p>
 
 ---
