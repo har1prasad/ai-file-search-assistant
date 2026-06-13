@@ -1,9 +1,8 @@
 """
 test_pipeline.py — End-to-end pipeline test for AI File Search Assistant.
 
-Indexes all files in Sample_files/ into:
-    - SQLite  (metadata + extracted text)
-    - FAISS   (semantic embeddings)
+Indexes all files in Sample_files/ using the production FileIndexer class.
+Verify chunks database extraction and FAISS vector matching.
 
 Run from the project root:
     python tests/test_pipeline.py
@@ -11,15 +10,20 @@ Run from the project root:
 
 import sys
 import logging
+
+if sys.platform == "win32":
+    import io
+    sys.stdout.reconfigure(encoding='utf-8')
 from pathlib import Path
 
 # Ensure project root is on the path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.extraction import extract_text
-from app.database import DatabaseManager
-from app.embeddings import EmbeddingManager
-from app.search import FAISSManager
+from app.database.db_manager import DatabaseManager
+from app.embeddings.embedding_manager import EmbeddingManager
+from app.search.faiss_manager import FAISSManager
+from app.indexing.file_indexer import FileIndexer
+from app.search.search_engine import SearchEngine
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,81 +38,64 @@ db = DatabaseManager()
 em = EmbeddingManager()
 fm = FAISSManager()
 
+indexer = FileIndexer(
+    db_manager=db,
+    embedding_manager=em,
+    faiss_manager=fm,
+)
+
+search_engine = SearchEngine(
+    embedding_manager=em,
+    faiss_manager=fm,
+    db_manager=db,
+)
+
+# Reset databases for a clean test run
+print("Resetting databases for a clean run...")
+db.clear_all()
+fm.reset()
+fm.save()
+
 # ---------------------------------------------------------------------------
 # Index all files
 # ---------------------------------------------------------------------------
 
-files = list(SAMPLE_DIR.iterdir())
-print(f"\nFound {len(files)} files in {SAMPLE_DIR}\n")
+print(f"\nIndexing folder: {SAMPLE_DIR}")
 print("=" * 60)
 
-indexed = 0
-skipped = 0
-
-for file_path in sorted(files):
-    if not file_path.is_file():
-        continue
-
-    print(f"\nProcessing : {file_path.name}")
-
-    # Step 1 — Extract text
-    content = extract_text(str(file_path))
-
-    if not content:
-        print(f"  ⚠  Skipped  — no text extracted (unsupported or empty)")
-        skipped += 1
-        continue
-
-    print(f"  ✓  Extracted  — {len(content)} characters")
-
-    # Step 2 — Store metadata in SQLite
-    file_id = db.upsert_file(
-        path=str(file_path),
-        filename=file_path.name,
-        extension=file_path.suffix.lower(),
-        size=file_path.stat().st_size,
-        modified_time=str(file_path.stat().st_mtime),
-        content=content,
-    )
-    print(f"  ✓  DB upsert  — file_id={file_id}")
-
-    # Step 3 — Generate embedding and store in FAISS
-    embedding = em.generate_embedding(content)
-    fm.add_embedding(file_id=file_id, embedding=embedding)
-    print(f"  ✓  Embedded   — shape={embedding.shape}")
-
-    indexed += 1
-
-# ---------------------------------------------------------------------------
-# Save FAISS index
-# ---------------------------------------------------------------------------
-
-fm.save()
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
+summary = indexer.index_folder(SAMPLE_DIR)
 
 print("\n" + "=" * 60)
-print(f"  Indexed : {indexed} files")
-print(f"  Skipped : {skipped} files")
-print(f"  DB total: {db.count_files()} records")
-print(f"  FAISS   : {fm.get_total_vectors()} vectors")
+print("INDEXING PIPELINE SUMMARY:")
+for key, value in summary.items():
+    print(f"  {key.replace('_', ' ').capitalize()}: {value}")
 print("=" * 60)
 
 # ---------------------------------------------------------------------------
-# Quick verification — fetch and preview each DB record
+# Verification
 # ---------------------------------------------------------------------------
 
-print("\nDB Records Preview:")
+print("\nSQLite Database Files Preview:")
 print("-" * 60)
 for record in db.get_all_files():
-    print(f"  [{record['id']}] {record['filename']} "
-          f"({record['extension']}) — {record['size']} bytes")
+    chunks = db.get_chunks_by_file_id(record['id'])
+    print(f"  [{record['id']}] {record['filename']} ({record['extension']}) "
+          f"— {record['size']} bytes, {len(chunks)} chunk(s)")
+
+print("\nFAISS Index Statistics:")
+print("-" * 60)
+print(f"  Total Vectors: {fm.get_total_vectors()}")
 
 # ---------------------------------------------------------------------------
-# Uncomment to reset everything and start fresh
+# Run a test search query
 # ---------------------------------------------------------------------------
-# db.clear_all()
-# fm.reset()
-# fm.save()
+
+test_query = "python programming resume or cover letter"
+print(f"\nRunning test semantic search for: '{test_query}'")
+print("-" * 60)
+search_results = search_engine.search(test_query, top_k=3)
+
+for idx, result in enumerate(search_results, start=1):
+    print(f"  {idx}. {result['filename']} — Score: {result['similarity_score']:.4f}")
+    if "matching_chunks" in result and result["matching_chunks"]:
+        print(f"     Match: {result['matching_chunks'][0][:150]}...")

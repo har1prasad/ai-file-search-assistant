@@ -214,6 +214,39 @@ class FAISSManager:
         removed = self.index.remove_ids(id_selector)
         logger.info("Removed file_id=%d. Vectors removed: %d", file_id, removed)
 
+    def remove_ids(self, ids: list[int]) -> None:
+        """Remove multiple vectors from the index by their IDs.
+
+        Args:
+            ids: List of integer IDs to remove.
+        """
+        if not ids:
+            return
+        id_selector = faiss.IDSelectorArray(np.array(ids, dtype=np.int64))
+        removed = self.index.remove_ids(id_selector)
+        logger.info("Removed %d vectors from FAISS index.", removed)
+
+    def get_embeddings(self, ids: list[int]) -> np.ndarray | None:
+        """Retrieve embeddings from the FAISS index by their IDs using reconstruction.
+
+        Args:
+            ids: List of integer vector IDs.
+
+        Returns:
+            2-D numpy array of shape (n, dimension), or None if any ID fails.
+        """
+        if not ids:
+            return None
+        vectors = []
+        for vid in ids:
+            try:
+                vec = self.index.reconstruct(int(vid))
+                vectors.append(vec)
+            except Exception:
+                logger.warning("Failed to reconstruct vector for ID=%d", vid)
+                return None
+        return np.array(vectors, dtype="float32")
+
     def rebuild(self, file_ids: list[int], embeddings: np.ndarray) -> None:
         """Replace the current index with a fresh one built from the given data.
 

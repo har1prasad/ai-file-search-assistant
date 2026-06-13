@@ -15,8 +15,7 @@ from app.ui.main_window import MainWindow
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("AI File Search Assistant")
-    app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
-
+    
     window = MainWindow()
     window.show()
 

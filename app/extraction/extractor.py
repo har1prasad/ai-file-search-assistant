@@ -507,6 +507,10 @@ def chunk_text(
                 chunk = chunk[: boundary + 1]
 
         chunks.append(chunk.strip())
+        
+        if start + len(chunk) >= len(text):
+            break
+            
         start += max(1, len(chunk) - overlap)
 
     return [c for c in chunks if c]

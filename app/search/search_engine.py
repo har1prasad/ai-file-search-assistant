@@ -1,35 +1,8 @@
 """
-search_engine.py — Semantic search engine for AI File Search Assistant.
-
-Ties together all three core components of the pipeline:
-    - EmbeddingManager  : converts a natural language query into a vector
-    - FAISSManager      : finds the most similar file vectors in the index
-    - DatabaseManager   : fetches full file metadata for each matched file_id
-
-The SearchEngine is the single entry point the UI layer interacts with.
-Everything below it is an implementation detail.
-
-Pipeline for a single search:
-    user query (str)
-        → EmbeddingManager.generate_embedding()   → query vector (384,)
-        → FAISSManager.search()                    → [(file_id, score), ...]
-        → DatabaseManager.get_file_by_id()         → [{ metadata + score }, ...]
-        → returned to caller
-
-Example usage:
-    from app.search.search_engine import SearchEngine
-
-    engine = SearchEngine()
-    results = engine.search("Python classes and inheritance", top_k=5)
-    for r in results:
-        print(r["filename"], r["similarity_score"])
+search_engine.py — Optimized hybrid semantic & keyword search engine.
 """
 
 from __future__ import annotations
-
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import logging
 from typing import Any
@@ -38,165 +11,124 @@ from app.database.db_manager import DatabaseManager
 from app.embeddings.embedding_manager import EmbeddingManager
 from app.search.faiss_manager import FAISSManager
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# SearchEngine
-# ---------------------------------------------------------------------------
-
-
 class SearchEngine:
-    """Orchestrates semantic search across indexed files.
-
-    Accepts a natural language query, converts it to an embedding,
-    finds the closest matches in the FAISS index, and enriches each
-    result with file metadata from SQLite.
-
-    Args:
-        embedding_manager: An initialised EmbeddingManager instance.
-                           If None, a default instance is created.
-        faiss_manager:     An initialised FAISSManager instance.
-                           If None, a default instance is created.
-        db_manager:        An initialised DatabaseManager instance.
-                           If None, a default instance is created.
-    """
+    """Hybrid search over indexed files (Semantic Vector + FTS5 Keywords)."""
 
     def __init__(
         self,
-        embedding_manager: EmbeddingManager | None = None,
-        faiss_manager: FAISSManager | None = None,
-        db_manager: DatabaseManager | None = None,
+        embedding_manager: EmbeddingManager,
+        faiss_manager: FAISSManager,
+        db_manager: DatabaseManager,
     ) -> None:
-        self.embedding_manager = embedding_manager or EmbeddingManager()
-        self.faiss_manager = faiss_manager or FAISSManager()
-        self.db_manager = db_manager or DatabaseManager()
-        logger.info("SearchEngine initialised.")
-
-    # ------------------------------------------------------------------
-    # Core search
-    # ------------------------------------------------------------------
+        self.embedding_manager = embedding_manager
+        self.faiss_manager = faiss_manager
+        self.db_manager = db_manager
+        logger.info("SearchEngine initialized.")
 
     def search(self, query: str, top_k: int = 10) -> list[dict[str, Any]]:
-        """Search indexed files using a natural language query.
+        """Search indexed files using a hybrid model (FAISS + SQLite FTS5).
 
-        Steps:
-            1. Validate query and top_k.
-            2. Generate a query embedding.
-            3. Search the FAISS index for the closest vectors.
-            4. Fetch metadata from SQLite for each matched file_id.
-            5. Attach similarity_score to each metadata dict.
-            6. Return the ranked result list.
-
-        Args:
-            query:  Natural language search query.
-            top_k:  Maximum number of results to return. Must be > 0.
-
-        Returns:
-            A list of metadata dicts, each containing all SQLite columns
-            plus a "similarity_score" key (float, 0.0 – 1.0).
-            Results are ordered by descending similarity score.
-
-        Raises:
-            ValueError: If query is empty or whitespace-only.
-            ValueError: If top_k is not a positive integer.
+        Matches concepts semantically and exact keywords, blending scores.
         """
-        # --- Validation ---
-        if not query or not query.strip():
-            raise ValueError("Search query must not be empty.")
+        query = query.strip()
+
+        if not query:
+            raise ValueError("Search query cannot be empty.")
+
         if top_k <= 0:
-            raise ValueError(f"top_k must be a positive integer, got {top_k}.")
+            raise ValueError("top_k must be > 0")
 
-        logger.info("Search started. query='%s'  top_k=%d", query, top_k)
+        # 1. Semantic retrieval (FAISS)
+        vector_matches = []
+        if not self.faiss_manager.is_empty():
+            query_embedding = self.embedding_manager.generate_embedding(query)
+            vector_matches = self.faiss_manager.search(query_embedding, top_k * 3)
 
-        # --- Embed the query ---
-        query_embedding = self.embedding_manager.generate_embedding(query)
+        # 2. Exact keyword retrieval (SQLite FTS5)
+        fts_matches = self.db_manager.search_fts(query, limit=top_k * 3)
 
-        # --- Search FAISS ---
-        vector_matches = self.faiss_manager.search(query_embedding, top_k=top_k)
-        logger.info("Vector matches returned: %d", len(vector_matches))
+        # 3. Score blending (Hybrid RRF / Weighted combination)
+        combined_scores: dict[int, dict[str, float]] = {}
 
-        # --- Enrich with metadata ---
-        results: list[dict[str, Any]] = []
-        for file_id, score in vector_matches:
-            metadata = self.db_manager.get_file_by_id(file_id)
-            if metadata:
-                metadata["similarity_score"] = score
-                results.append(metadata)
+        # Parse vector scores (cosine similarity range is typically 0.0 to 1.0)
+        for chunk_id, sem_score in vector_matches:
+            clamped_sem = max(0.0, min(1.0, float(sem_score)))
+            combined_scores[chunk_id] = {
+                "semantic": clamped_sem,
+                "keyword": 0.0
+            }
 
-        logger.info("Final results with metadata: %d", len(results))
+        # Parse FTS5 BM25 scores (range: lower is better, usually negative)
+        if fts_matches:
+            bm25_scores = [score for _, score in fts_matches]
+            min_score = min(bm25_scores)
+            max_score = max(bm25_scores)
+            score_range = max_score - min_score
+
+            for chunk_id, bm25_score in fts_matches:
+                # Normalize BM25 score from 0.0 (worst) to 1.0 (best)
+                norm_keyword = 1.0
+                if score_range > 0.0001:
+                    norm_keyword = 1.0 - ((bm25_score - min_score) / score_range)
+
+                if chunk_id in combined_scores:
+                    combined_scores[chunk_id]["keyword"] = norm_keyword
+                else:
+                    combined_scores[chunk_id] = {
+                        "semantic": 0.0,
+                        "keyword": norm_keyword
+                    }
+
+        # 4. Resolve chunks and aggregate by parent file ID
+        results_map = {}
+        for chunk_id, scores in combined_scores.items():
+            sem = scores["semantic"]
+            kw = scores["keyword"]
+
+            # Blending logic
+            if sem > 0.0 and kw > 0.0:
+                hybrid_score = 0.7 * sem + 0.3 * kw
+            elif sem > 0.0:
+                hybrid_score = sem
+            else:
+                hybrid_score = 0.5 * kw  # Keyword-only match slightly discounted
+
+            chunk = self.db_manager.get_chunk_by_id(chunk_id)
+            if chunk:
+                file_id = chunk["file_id"]
+                if file_id not in results_map:
+                    metadata = self.db_manager.get_file_by_id(file_id)
+                    if metadata:
+                        metadata["similarity_score"] = hybrid_score
+                        metadata["matching_chunks"] = [chunk["content"]]
+                        results_map[file_id] = metadata
+                else:
+                    # Keep the highest match score, accumulate matching chunks
+                    if hybrid_score > results_map[file_id]["similarity_score"]:
+                        results_map[file_id]["similarity_score"] = hybrid_score
+                    results_map[file_id]["matching_chunks"].append(chunk["content"])
+
+        # Sort the aggregated unique file results by combined similarity score descending
+        results = sorted(results_map.values(), key=lambda x: x["similarity_score"], reverse=True)[:top_k]
+
+        logger.info("Hybrid search yielded %d unique file matches.", len(results))
         return results
 
-    # ------------------------------------------------------------------
-    # Convenience methods
-    # ------------------------------------------------------------------
-
     def search_paths(self, query: str, top_k: int = 10) -> list[str]:
-        """Return only the file paths from search results.
-
-        Args:
-            query:  Natural language search query.
-            top_k:  Maximum number of results.
-
-        Returns:
-            A list of file path strings ordered by descending similarity.
-        """
-        results = self.search(query, top_k=top_k)
+        results = self.search(query, top_k)
         return [r["path"] for r in results if "path" in r]
 
     def search_with_scores(
-        self, query: str, top_k: int = 10
+        self,
+        query: str,
+        top_k: int = 10
     ) -> list[tuple[str, float]]:
-        """Return (file_path, similarity_score) tuples from search results.
-
-        Args:
-            query:  Natural language search query.
-            top_k:  Maximum number of results.
-
-        Returns:
-            A list of (path, score) tuples ordered by descending similarity.
-        """
-        results = self.search(query, top_k=top_k)
+        results = self.search(query, top_k)
         return [
             (r["path"], r["similarity_score"])
             for r in results
             if "path" in r
         ]
-
-
-# ---------------------------------------------------------------------------
-# Quick smoke-test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-
-    # Ensure project root is on the path when run directly
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-    logging.basicConfig(level=logging.INFO)
-
-    engine = SearchEngine()
-    query = input("Search query: ").strip()
-
-    if not query:
-        print("No query entered. Exiting.")
-        sys.exit(0)
-
-    results = engine.search(query, top_k=5)
-
-    if not results:
-        print("No results found.")
-    else:
-        print("\nResults:")
-        for i, result in enumerate(results, start=1):
-            print(
-                f"{i}. {result.get('filename', 'Unknown')} "
-                f"(score={result['similarity_score']:.4f})"
-            )
-            print(f"   {result.get('path', 'N/A')}")

@@ -74,6 +74,7 @@ output/
 Sample_files/
 sample_files/
 test_files/
+demo_files/
 
 # Archives
 *.zip
